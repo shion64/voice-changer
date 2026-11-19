@@ -1,7 +1,9 @@
 from typing import Any
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
+from functools import partial
+from torch.amp import autocast as _autocast
+autocast = partial(_autocast, "cuda")
 from Exceptions import (
     DeviceCannotSupportHalfPrecisionException,
     DeviceChangingException,

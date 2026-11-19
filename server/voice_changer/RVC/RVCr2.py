@@ -2,6 +2,7 @@
 VoiceChangerV2向け
 """
 
+import os
 from dataclasses import asdict
 import numpy as np
 import torch
@@ -32,6 +33,17 @@ import resampy
 from typing import cast
 
 logger = VoiceChangaerLogger.get_instance().getLogger()
+
+
+def _offline_pad_sec() -> float:
+    """一括変換(TTS用)で前後に付ける reflect padding の秒数。環境変数 RVC_OFFLINE_PAD_SEC (0.1〜2.0、既定1.0)"""
+    try:
+        return min(max(float(os.environ.get("RVC_OFFLINE_PAD_SEC", "1.0")), 0.1), 2.0)
+    except ValueError:
+        return 1.0
+
+
+OFFLINE_PAD_SEC = _offline_pad_sec()
 
 
 class RVCr2(VoiceChangerModel):
@@ -263,7 +275,7 @@ class RVCr2(VoiceChangerModel):
 
         return
 
-    def inference_offline(self, pcm: np.ndarray, sample_rate: int):
+    def inference_offline(self, pcm: np.ndarray, sample_rate: int, pad_sec=None):
         """文全体を1回で変換する(Applio方式)。
 
         リアルタイム用の内部バッファ / SOLA / クロスフェード / 音量スケール / 無音しきい値は使わず、
@@ -278,7 +290,8 @@ class RVCr2(VoiceChangerModel):
             raise ValueError("audio is too short (min 0.1s)")
 
         # 前後に最大1秒の reflect padding (Pipeline 側は repeat*(n-1) サンプルを前後に付ける)
-        pad = min(16000, n - 1)
+        pad_limit = OFFLINE_PAD_SEC if pad_sec is None else min(max(float(pad_sec), 0.1), 2.0)
+        pad = min(int(pad_limit * 16000), n - 1)
         repeat = pad / (n - 1)
 
         device = self.pipeline.device

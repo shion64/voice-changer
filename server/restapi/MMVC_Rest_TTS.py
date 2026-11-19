@@ -12,12 +12,15 @@
 """
 import asyncio
 import hashlib
+import heapq
 import io
 import ipaddress
+import itertools
 import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -44,10 +47,15 @@ MAX_AUDIO_SEC = 40  # 1チャンクあたりの上限
 MAX_TOTAL_SEC = 300  # 1リクエスト全体の上限
 GAP_SEC = 0.15  # チャンク間の無音
 FALLBACK_ON_SILENT_RVC = True  # RVC出力が無音のチャンクは、変換前の音声で代用して読み上げを止めない
+RETRY_ON_SILENT_RVC = True  # 無音出力は、余白を変えて1回だけ再変換してから代用に回す
+RETRY_PAD_SEC = 0.5
+IDLE_TRIM_SEC = 10  # 最後の変換からこの秒数、新しい要求が無ければ、PyTorchが抱え込んだ空きVRAMを返す (0で無効)
+EDGE_CONCURRENCY = 4  # Edge-TTSへの同時接続数 (全リクエスト合計)
 MAX_SILENT_STREAK = 3  # RVC出力が無音の変換がこの回数連続したら、設定異常とみなしてエラーにする
 MAX_BODY_BYTES = 64 * 1024
 MAX_MP3_BYTES = 8 * 1024 * 1024
-CACHE_MAX = 32
+CACHE_MAX = 256  # 件数の上限
+CACHE_MAX_BYTES = 128 * 1024 * 1024  # 合計サイズの上限
 TTS_TIMEOUT_SEC = 30
 SILENCE_THRESHOLD = 200  # int16。これ以下は無音扱いで前後をトリム
 INTERNAL_RATE = 24000  # Edge-TTS (mp3 24kHz) のデコード先
@@ -101,6 +109,47 @@ def split_text(text: str, limit: int = CHUNK_CHARS) -> list:
     if cur:
         chunks.append(cur)
     return chunks
+
+
+class _PriorityLock:
+    """優先度(小さいほど先)順に取得させる非同期ロック。
+
+    RVC変換の順番を「リクエストの到着順 -> チャンク順」に揃える。Read Aloud は先読みで複数リクエストを
+    同時に投げるので、Edge-TTSの取得が早く終わった後続の文が、いま再生に必要な文より先に変換されるのを防ぐ。
+    """
+
+    def __init__(self):
+        self._locked = False
+        self._waiters: list = []  # heap of (priority, seq, future)
+        self._seq = itertools.count()
+
+    async def acquire(self, priority) -> None:
+        if not self._locked and not self._waiters:
+            self._locked = True
+            return
+        fut = asyncio.get_running_loop().create_future()
+        entry = (priority, next(self._seq), fut)
+        heapq.heappush(self._waiters, entry)
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                self.release()  # 既にロックを渡されていた場合は、次の待機者へ回す
+            else:
+                try:
+                    self._waiters.remove(entry)
+                    heapq.heapify(self._waiters)
+                except ValueError:
+                    pass
+            raise
+
+    def release(self) -> None:
+        while self._waiters:
+            _, _, fut = heapq.heappop(self._waiters)
+            if not fut.done():
+                fut.set_result(None)  # locked のまま次の待機者へ引き継ぐ
+                return
+        self._locked = False
 
 
 class TTSError(Exception):
@@ -161,6 +210,7 @@ class MMVC_Rest_TTS:
         self.router.add_api_route("/tts/api/settings", self.post_settings, methods=["POST"])
         self.router.add_api_route("/tts/api/status", self.status, methods=["GET"])
         self.router.add_api_route("/tts/api/voices", self.voices, methods=["GET"])
+        self.router.add_api_route("/tts/api/trim", self.trim, methods=["POST"])
         for path in ("/models", "/v1/models"):
             self.router.add_api_route(path, self.models, methods=["GET"])
         for path in ("/audio/speech", "/v1/audio/speech"):
@@ -170,7 +220,12 @@ class MMVC_Rest_TTS:
         self._settings_lock = threading.Lock()
         self._cache: "OrderedDict[str, bytes]" = OrderedDict()
         self._waiting = 0
-        self._rvc_lock = asyncio.Lock()
+        self._rvc_lock = _PriorityLock()
+        self._edge_sem = None
+        self._edge_sem_loop = None
+        self._trim_task = None
+        self._request_seq = itertools.count()
+        self._cache_bytes = 0
         self._silent_streak = 0
         self._voices_cache: tuple = (0.0, [])
 
@@ -201,6 +256,49 @@ class MMVC_Rest_TTS:
             raise
 
     # ------------------------------------------------------------ 共通
+    @staticmethod
+    def _vram_info():
+        """{"allocated": MiB, "reserved": MiB} (GPUなし/torch未導入なら None)。allocated=実際に使用中、reserved=PyTorchが確保済み"""
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return None
+            mib = 1024 * 1024
+            return {"allocated": round(torch.cuda.memory_allocated() / mib), "reserved": round(torch.cuda.memory_reserved() / mib)}
+        except Exception:
+            return None
+
+    def _trim_vram(self):
+        """未使用のキャッシュVRAMを返す。戻り値は (前, 後) の info"""
+        before = self._vram_info()
+        if before is None:
+            return None, None
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception as e:
+            logger.warning("[TTS] VRAM解放に失敗: %s", e)
+            return before, before
+        after = self._vram_info()
+        logger.info("[TTS] VRAM解放: reserved %d -> %d MiB (使用中 %d MiB)", before["reserved"], after["reserved"], after["allocated"])
+        return before, after
+
+    def _schedule_trim(self) -> None:
+        """変換のたびに呼ぶ。静かな状態が IDLE_TRIM_SEC 続いたら一度だけ VRAM を返す (連続リクエスト中は何もしない)"""
+        if IDLE_TRIM_SEC <= 0:
+            return
+        if self._trim_task is not None and not self._trim_task.done():
+            self._trim_task.cancel()
+        self._trim_task = asyncio.ensure_future(self._trim_when_idle())
+
+    async def _trim_when_idle(self) -> None:
+        try:
+            await asyncio.sleep(IDLE_TRIM_SEC)
+            if self._waiting == 0:
+                await asyncio.to_thread(self._trim_vram)
+        except asyncio.CancelledError:
+            pass
+
     def _model_ready(self) -> bool:
         vc = getattr(self.manager, "voiceChanger", None)
         model = getattr(vc, "voiceChanger", None)
@@ -274,7 +372,17 @@ class MMVC_Rest_TTS:
             edge_ok = True
         except ImportError:
             edge_ok = False
-        return JSONResponse({"model_ready": self._model_ready(), "edge_tts": edge_ok, "ffmpeg": shutil.which("ffmpeg") is not None})
+        return JSONResponse({
+            "model_ready": self._model_ready(), "edge_tts": edge_ok, "ffmpeg": shutil.which("ffmpeg") is not None,
+            "vram": self._vram_info(),
+        })
+
+    async def trim(self, request: Request):
+        """PyTorchのキャッシュ済みVRAMを今すぐ返す (モデル本体の分は残る)"""
+        if not _is_local(request):
+            return _err(403, "local access only")
+        before, after = await asyncio.to_thread(self._trim_vram)
+        return JSONResponse({"before": before, "after": after})
 
     async def voices(self, request: Request):
         if not _is_local(request):
@@ -346,40 +454,66 @@ class MMVC_Rest_TTS:
 
         self._waiting += 1
         started = time.monotonic()
+        req_seq = next(self._request_seq)
+        stats = {"tts_wait": 0.0, "rvc": 0.0, "enc": 0.0}
         try:
             parts, total, fallbacks = [], 0.0, 0
             chunks = split_text(text)
-            for chunk in chunks:
-                try:
-                    pcm, rate = await self._synth_edge(chunk, voice, speed)
-                    if pcm.size == 0 or int(np.abs(pcm.astype(np.int32)).max()) <= SILENCE_THRESHOLD:
-                        raise Unspeakable()
-                    if pcm.size > MAX_AUDIO_SEC * rate:
-                        raise TTSError(413, f"generated audio too long (max {MAX_AUDIO_SEC}s per chunk)")
-                    if rvc:
-                        src_pcm, src_rate = pcm, rate
-                        pcm, rate = await self._convert(src_pcm, src_rate)
-                        peak = int(np.abs(pcm.astype(np.int32)).max()) if pcm.size else 0
-                        if peak <= SILENCE_THRESHOLD:
-                            self._silent_streak += 1
-                            logger.warning(
-                                "[TTS] RVC出力が無音 (chars=%d in=%.2fs in_peak=%d out=%.2fs out_peak=%d streak=%d)",
-                                len(chunk), src_pcm.size / src_rate, int(np.abs(src_pcm.astype(np.int32)).max()),
-                                pcm.size / rate, peak, self._silent_streak,
-                            )
-                            if not FALLBACK_ON_SILENT_RVC or self._silent_streak >= MAX_SILENT_STREAK:
-                                raise TTSError(502, "RVCの出力が無音です (モデル/ピッチ設定を確認してください)")
-                            pcm, rate = src_pcm, src_rate  # 変換前の音声で代用
-                            fallbacks += 1
-                        else:
-                            self._silent_streak = 0
-                    pcm = self._trim_and_fade(pcm, rate)
-                except Unspeakable:
-                    continue  # 記号だけの断片などは飛ばす
-                total += pcm.size / rate
-                if total > MAX_TOTAL_SEC:
-                    raise TTSError(413, f"generated audio too long (max {MAX_TOTAL_SEC}s)")
-                parts.append((pcm, rate))
+            tasks: list = [None] * len(chunks)
+
+            def prefetch(i: int) -> None:
+                if i < len(chunks) and tasks[i] is None:
+                    tasks[i] = asyncio.ensure_future(self._tts_chunk(chunks[i], voice, speed))
+
+            try:
+                for i in range(len(chunks)):
+                    prefetch(i)  # Edge-TTS取得は全チャンク同時に開始 (同時接続数は _edge_sem で制限)
+                for i, chunk in enumerate(chunks):
+                    try:
+                        t0 = time.monotonic()
+                        pcm, rate = await tasks[i]
+                        stats["tts_wait"] += time.monotonic() - t0
+                        if rvc:
+                            src_pcm, src_rate = pcm, rate
+                            t0 = time.monotonic()
+                            pcm, rate = await self._convert(src_pcm, src_rate, (req_seq, i))
+                            peak = int(np.abs(pcm.astype(np.int32)).max()) if pcm.size else 0
+                            if peak <= SILENCE_THRESHOLD and RETRY_ON_SILENT_RVC:
+                                # 数値が壊れて全部0になることがある。余白(=系列長)を変えて1回だけ再変換する
+                                logger.warning("[TTS] RVC出力が無音のため再変換します (chars=%d in=%.2fs pad=%.1fs)",
+                                               len(chunk), src_pcm.size / src_rate, RETRY_PAD_SEC)
+                                pcm, rate = await self._convert(src_pcm, src_rate, (req_seq, i), RETRY_PAD_SEC)
+                                peak = int(np.abs(pcm.astype(np.int32)).max()) if pcm.size else 0
+                                logger.warning("[TTS] 再変換の結果: %s (out_peak=%d)", "成功" if peak > SILENCE_THRESHOLD else "まだ無音", peak)
+                            stats["rvc"] += time.monotonic() - t0
+                            if peak <= SILENCE_THRESHOLD:
+                                self._silent_streak += 1
+                                logger.warning(
+                                    "[TTS] RVC出力が無音 (chars=%d in=%.2fs in_peak=%d out=%.2fs out_peak=%d streak=%d)",
+                                    len(chunk), src_pcm.size / src_rate, int(np.abs(src_pcm.astype(np.int32)).max()),
+                                    pcm.size / rate, peak, self._silent_streak,
+                                )
+                                if not FALLBACK_ON_SILENT_RVC or self._silent_streak >= MAX_SILENT_STREAK:
+                                    raise TTSError(502, "RVCの出力が無音です (モデル/ピッチ設定を確認してください)")
+                                pcm, rate = src_pcm, src_rate  # 変換前の音声で代用
+                                fallbacks += 1
+                            else:
+                                self._silent_streak = 0
+                        pcm = self._trim_and_fade(pcm, rate)
+                    except Unspeakable:
+                        continue  # 記号だけの断片などは飛ばす
+                    total += pcm.size / rate
+                    if total > MAX_TOTAL_SEC:
+                        raise TTSError(413, f"generated audio too long (max {MAX_TOTAL_SEC}s)")
+                    parts.append((pcm, rate))
+            finally:
+                # 途中で失敗/中断した場合に、先読み中のEdge-TTS取得を残さない
+                pending = [t for t in tasks if t is not None]
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+
             if parts:
                 rate = max(r for _, r in parts)  # 代用音声と変換後でSRが違う場合は高い方に揃える
                 gap = np.zeros(int(GAP_SEC * rate), dtype=np.int16)
@@ -393,34 +527,69 @@ class MMVC_Rest_TTS:
                 logger.warning("[TTS] 読み上げ不可の入力 (chars=%d) -> 無音を返します", len(text))
                 rate = INTERNAL_RATE
                 pcm = np.zeros(int(0.2 * rate), dtype=np.int16)
+            t0 = time.monotonic()
             data = await self._encode(pcm, rate, fmt)
+            stats["enc"] = time.monotonic() - t0
         finally:
             self._waiting -= 1
 
-        logger.info("[TTS] ok chars=%d chunks=%d rvc=%s fallbacks=%d audio=%.2fs took=%.2fs", len(text), len(chunks), rvc, fallbacks, pcm.size / rate, time.monotonic() - started)
-        self._cache[key] = data
-        while len(self._cache) > CACHE_MAX:
-            self._cache.popitem(last=False)
+        logger.info(
+            "[TTS] ok chars=%d chunks=%d rvc=%s fallbacks=%d audio=%.2fs took=%.2fs (tts_wait=%.2fs rvc=%.2fs enc=%.2fs)",
+            len(text), len(chunks), rvc, fallbacks, pcm.size / rate, time.monotonic() - started,
+            stats["tts_wait"], stats["rvc"], stats["enc"],
+        )
+        self._cache_put(key, data)
         return data
+
+    def _cache_put(self, key: str, data: bytes) -> None:
+        old = self._cache.pop(key, None)
+        if old is not None:
+            self._cache_bytes -= len(old)
+        self._cache[key] = data
+        self._cache_bytes += len(data)
+        while self._cache and (len(self._cache) > CACHE_MAX or self._cache_bytes > CACHE_MAX_BYTES):
+            _, evicted = self._cache.popitem(last=False)
+            self._cache_bytes -= len(evicted)
+
+    def _edge_semaphore(self) -> asyncio.Semaphore:
+        """Edge-TTSの同時接続数を制限する。イベントループが変わっても壊れないよう、ループごとに作る"""
+        loop = asyncio.get_running_loop()
+        if self._edge_sem is None or self._edge_sem_loop is not loop:
+            self._edge_sem = asyncio.Semaphore(EDGE_CONCURRENCY)
+            self._edge_sem_loop = loop
+        return self._edge_sem
+
+    async def _tts_chunk(self, chunk: str, voice: str, speed: float):
+        """1チャンク分のEdge-TTS取得と検証 (RVC変換と並行して走らせる)"""
+        async with self._edge_semaphore():
+            pcm, rate = await self._synth_edge(chunk, voice, speed)
+        if pcm.size == 0 or int(np.abs(pcm.astype(np.int32)).max()) <= SILENCE_THRESHOLD:
+            raise Unspeakable()
+        if pcm.size > MAX_AUDIO_SEC * rate:
+            raise TTSError(413, f"generated audio too long (max {MAX_AUDIO_SEC}s per chunk)")
+        return pcm, rate
 
     # ------------------------------------------------------------ パイプライン部品
     @staticmethod
     async def _ffmpeg(args: list, data: bytes, what: str) -> bytes:
+        """ffmpeg を別スレッドで実行する (asyncio のサブプロセスは、先読みの中止と重なると wait が戻らないことがあるため使わない)。
+        シェルは介さず引数リストで起動し、30秒で打ち切る。呼び出し側がキャンセルされても、ffmpeg は短時間で自然に終わる。"""
         if shutil.which("ffmpeg") is None:
             raise TTSError(502, "ffmpeg が見つかりません (pacman -S ffmpeg)")
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", "-loglevel", "error", *args,
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", *args]
+
+        def run():
+            return subprocess.run(cmd, input=data, capture_output=True, timeout=30)
+
         try:
-            out, err = await asyncio.wait_for(proc.communicate(data), timeout=30)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            proc = await asyncio.to_thread(run)
+        except subprocess.TimeoutExpired:
             raise TTSError(502, f"ffmpeg ({what}) がタイムアウトしました")
-        if proc.returncode != 0 or not out:
-            raise TTSError(502, f"ffmpeg ({what}) 失敗: {err.decode(errors='replace')[:120]}")
-        return out
+        except OSError as e:
+            raise TTSError(502, f"ffmpeg ({what}) を起動できません: {e}")
+        if proc.returncode != 0 or not proc.stdout:
+            raise TTSError(502, f"ffmpeg ({what}) 失敗: {proc.stderr.decode(errors='replace')[:120]}")
+        return proc.stdout
 
     async def _synth_edge(self, text: str, voice: str, speed: float):
         try:
@@ -451,17 +620,21 @@ class MMVC_Rest_TTS:
         out = await self._ffmpeg(["-i", "pipe:0", "-f", "s16le", "-ar", str(INTERNAL_RATE), "-ac", "1", "pipe:1"], mp3, "decode")
         return np.frombuffer(out, dtype="<i2").astype(np.int16), INTERNAL_RATE
 
-    async def _convert(self, pcm: np.ndarray, rate: int):
-        async with self._rvc_lock:  # GPU同時実行を避けて直列化
-            try:
-                return await asyncio.to_thread(self.manager.convert_offline, pcm, rate)
-            except ValueError as e:
-                raise TTSError(400, str(e))
-            except RuntimeError as e:  # モデル未ロード / GPUメモリ不足 など
-                raise TTSError(503, f"RVC変換に失敗しました: {str(e)[:160]}")
-            except Exception as e:
-                logger.error("[TTS] convert failed: %s", e)
-                raise TTSError(500, f"RVC変換に失敗しました: {str(e)[:160]}")
+    async def _convert(self, pcm: np.ndarray, rate: int, priority=(0, 0), pad_sec=None):
+        await self._rvc_lock.acquire(priority)  # GPU同時実行を避けて、到着順(リクエスト->チャンク)に直列化
+        try:
+            args = (pcm, rate) if pad_sec is None else (pcm, rate, pad_sec)
+            return await asyncio.to_thread(self.manager.convert_offline, *args)
+        except ValueError as e:
+            raise TTSError(400, str(e))
+        except RuntimeError as e:  # モデル未ロード / GPUメモリ不足 など
+            raise TTSError(503, f"RVC変換に失敗しました: {str(e)[:160]}")
+        except Exception as e:
+            logger.error("[TTS] convert failed: %s", e)
+            raise TTSError(500, f"RVC変換に失敗しました: {str(e)[:160]}")
+        finally:
+            self._rvc_lock.release()
+            self._schedule_trim()
 
     @staticmethod
     def _resample(pcm: np.ndarray, src: int, dst: int) -> np.ndarray:

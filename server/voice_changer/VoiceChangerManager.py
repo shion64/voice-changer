@@ -373,7 +373,7 @@ class VoiceChangerManager(ServerDeviceCallbacks):
             logger.info("Voice Change is not loaded. Did you load a correct model?")
             return np.zeros(1).astype(np.int16), []
 
-    def convert_offline(self, pcm, sample_rate: int):
+    def convert_offline(self, pcm, sample_rate: int, pad_sec=None):
         """文全体の一括変換 (RVC のみ対応)。リアルタイム用の状態には影響しない。"""
         vc = getattr(self, "voiceChanger", None)
         model = getattr(vc, "voiceChanger", None)
@@ -382,7 +382,7 @@ class VoiceChangerManager(ServerDeviceCallbacks):
         if not hasattr(model, "inference_offline"):
             raise RuntimeError("Offline conversion supports RVC models only.")
         with _CONVERT_LOCK:
-            return model.inference_offline(pcm, sample_rate)
+            return model.inference_offline(pcm, sample_rate, pad_sec)
 
     def export2onnx(self):
         return self.voiceChanger.export2onnx()
