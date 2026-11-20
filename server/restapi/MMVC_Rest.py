@@ -2,6 +2,7 @@ import os
 import sys
 
 from restapi.mods.trustedorigin import TrustedOriginMiddleware
+from restapi.mods.lan_guard import LanGuardMiddleware
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
@@ -68,6 +69,9 @@ class MMVC_Rest:
                     allow_methods=["GET", "POST", "OPTIONS"],
                     allow_headers=["Content-Type", "Authorization"],
                 )
+
+            # 最外層: loopback 以外は TTS API(+トークン)のみ許可、それ以外は全拒否
+            app_fastapi.add_middleware(LanGuardMiddleware)
 
             app_fastapi.mount(
                 "/front",

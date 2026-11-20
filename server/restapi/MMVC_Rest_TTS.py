@@ -181,6 +181,11 @@ def _is_local(request: Request) -> bool:
     return ip.is_loopback
 
 
+def _is_api_allowed(request: Request) -> bool:
+    """loopback、または LanGuardMiddleware が認証済みの印を付けた LAN リクエスト(/models, /v1/audio/speech 用)。"""
+    return _is_local(request) or request.scope.get("tts_lan_ok") is True
+
+
 def _validate_settings(src: dict) -> dict:
     """部分更新可。不正値は 400。bool は数値として扱わない。"""
     out = {}
@@ -411,14 +416,14 @@ class MMVC_Rest_TTS:
         return JSONResponse({"voices": voices, "fallback": fallback})
 
     async def models(self, request: Request):
-        if not _is_local(request):
+        if not _is_api_allowed(request):
             return _err(403, "local access only")
         # Read Aloud の保存時テストが GET {URL}/models を叩く
         return JSONResponse({"object": "list", "data": [{"id": "rvc-tts", "object": "model", "owned_by": "local"}]})
 
     # ------------------------------------------------------------ ルート: 音声合成
     async def speech(self, request: Request):
-        if not _is_local(request):
+        if not _is_api_allowed(request):
             return _err(403, "local access only")
         try:
             body = await self._read_json(request)
