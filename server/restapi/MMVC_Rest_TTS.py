@@ -229,6 +229,7 @@ class MMVC_Rest_TTS:
         self._edge_sem = None
         self._edge_sem_loop = None
         self._trim_task = None
+        self._trimming = False
         self._request_seq = itertools.count()
         self._cache_bytes = 0
         self._silent_streak = 0
@@ -292,7 +293,8 @@ class MMVC_Rest_TTS:
         """変換のたびに呼ぶ。静かな状態が IDLE_TRIM_SEC 続いたら一度だけ VRAM を返す (連続リクエスト中は何もしない)"""
         if IDLE_TRIM_SEC <= 0:
             return
-        if self._trim_task is not None and not self._trim_task.done():
+        # 解放の実行中(スレッド稼働中)は止めない。止めるとロックを早く手放して変換と重なる
+        if self._trim_task is not None and not self._trim_task.done() and not self._trimming:
             self._trim_task.cancel()
         self._trim_task = asyncio.ensure_future(self._trim_when_idle())
 
@@ -300,9 +302,29 @@ class MMVC_Rest_TTS:
         try:
             await asyncio.sleep(IDLE_TRIM_SEC)
             if self._waiting == 0:
-                await asyncio.to_thread(self._trim_vram)
+                await self._trim_exclusive(only_if_idle=True)
         except asyncio.CancelledError:
             pass
+
+    async def _trim_exclusive(self, only_if_idle: bool = False):
+        """RVCロックを最低優先で取ってから VRAM を返す (変換と絶対に重ならない)。
+
+        only_if_idle=True の場合、ロックを取れた時点でも要求が来ていれば何もしない。戻り値は (前, 後)。
+        """
+        await self._rvc_lock.acquire((float("inf"), 0))
+        try:
+            if only_if_idle and self._waiting != 0:
+                return None, None
+            self._trimming = True
+            fut = asyncio.ensure_future(asyncio.to_thread(self._trim_vram))
+            try:
+                return await asyncio.shield(fut)
+            except asyncio.CancelledError:
+                await asyncio.wait({fut})  # スレッドが終わるまでロックを手放さない
+                raise
+        finally:
+            self._trimming = False
+            self._rvc_lock.release()
 
     def _model_ready(self) -> bool:
         vc = getattr(self.manager, "voiceChanger", None)
@@ -386,7 +408,7 @@ class MMVC_Rest_TTS:
         """PyTorchのキャッシュ済みVRAMを今すぐ返す (モデル本体の分は残る)"""
         if not _is_local(request):
             return _err(403, "local access only")
-        before, after = await asyncio.to_thread(self._trim_vram)
+        before, after = await self._trim_exclusive()
         return JSONResponse({"before": before, "after": after})
 
     async def voices(self, request: Request):
