@@ -120,6 +120,10 @@ Windows, Mac(M1), Linux, Google Colab
 
 [通信編](tutorials/trouble_shoot_communication_ja.md)
 
+## TTS(Read Aloud 連携)
+
+Firefox の Read Aloud から、Edge-TTS + RVC の声で読み上げできます。手順は [tutorials/tts_read_aloud_ja.md](tutorials/tts_read_aloud_ja.md) を参照してください。
+
 ## 開発者の署名について
 
 本ソフトウェアは開発元の署名しておりません。下記のように警告が出ますが、コントロールキーを押しながらアイコンをクリックすると実行できるようになります。これは Apple のセキュリティポリシーによるものです。実行は自己責任となります。
