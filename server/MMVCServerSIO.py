@@ -167,7 +167,10 @@ if __name__ == "__main__":
 
     # ダウンロード(Sample)
     try:
-        downloadInitialSamples(args.sample_mode, args.model_dir)
+        try:
+            downloadInitialSamples(args.sample_mode, args.model_dir)
+        except Exception as e:
+            print(f"[startup] sample download skipped: {e}")
     except Exception as e:
         printMessage(f"[Voice Changer] loading sample failed {e}", level=2)
 

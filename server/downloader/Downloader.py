@@ -16,7 +16,7 @@ def download(params):
         os.makedirs(dirname, exist_ok=True)
 
     try:
-        req = requests.get(url, stream=True, allow_redirects=True)
+        req = requests.get(url, stream=True, allow_redirects=True, timeout=(5, 30))
         content_length = req.headers.get("content-length")
         progress_bar = tqdm(
             total=int(content_length) if content_length is not None else None,
@@ -45,7 +45,7 @@ def download_no_tqdm(params):
     if dirname != "":
         os.makedirs(dirname, exist_ok=True)
     try:
-        req = requests.get(url, stream=True, allow_redirects=True)
+        req = requests.get(url, stream=True, allow_redirects=True, timeout=(5, 30))
         with open(saveTo, "wb") as f:
             countToDot = 0
             for chunk in req.iter_content(chunk_size=1024):
